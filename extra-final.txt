@@ -1,0 +1,367 @@
+h1. Decision Engine API - Knowledge Transfer Document
+
+(toc:minLevel=1|maxLevel=4)
+
+----
+
+h2. 1. Overview
+
+This service acts as a Decision Engine API that:
+
+- Fetches request data (shortJSON) from DB
+- Builds full PCSM input JSON
+- Calls PCSM (NTJSEMJSONInterface)
+- Processes response (outputJSON)
+- Returns summarized response to client
+
+----
+
+h2. 2. High Level Flow
+
+{code}
+Client Request
+   ↓
+DecisionController
+   ↓
+DecisionServiceImpl
+   ↓
+fetchAndValidateRequest()
+   ↓
+shortJSON (DB)
+   ↓
+Sequence Execution (Tasks)
+   ↓
+Build DAJSONDocument
+   ↓
+Call PCSM API
+   ↓
+Receive outputJSON
+   ↓
+Build Response
+   ↓
+Return to Client
+{code}
+
+----
+
+h2. 3. Project Structure
+
+{code}
+com.barclays.api.decision
+ ├── block.config
+ ├── config
+ ├── controller
+ ├── encoder.converter
+ ├── exceptions
+ ├── gateway
+ ├── model
+ ├── sequence
+ ├── service
+ ├── utils
+{code}
+
+----
+
+h2. 4. JSON Structures
+
+h3. 4.1 shortJSON (DB Input)
+
+{code:json}
+{
+  "APPLDATA": {},
+  "EQUDERIV": {},
+  "EXPDERIV": {},
+  "VECTUS": {},
+  "EXPBUR": {},
+  "EQUBUR": {},
+  "FHRDATA": {},
+  "ERA1DATA": {},
+  "ERA2DATA": {},
+  "UCLDATA": {},
+  "TACDATA": {},
+  "TAC3INC": {},
+  "SPAREFIELD": {},
+  "TRIUMPH": {},
+  "ADDEQDER": {},
+  "MULTIQT": {}
+}
+{code}
+
+----
+
+h3. 4.2 inputJSON (PCSM Request)
+
+{code:json}
+{
+  "DAJSONDocument": {
+    "OCONTROL": {},
+    "APPLDATA": {},
+    "ADDEQDER": {},
+    "EQUBUR": {},
+    "EQUDERIV": {},
+    "ERA1DATA": {},
+    "ERA2DATA": {},
+    "EXPBUR": {},
+    "EXPDERIV": {},
+    "FHRDATA": {},
+    "PARAMTER": {},
+    "RESULTS": {},
+    "SUMMARY": {},
+    "TAC3INC": {},
+    "TACDATA": {},
+    "TRIUMPH": {},
+    "UCLDATA": {},
+    "VECTUS": {},
+    "MULTIQT": {},
+    "MQRESULT": {},
+    "MQSUMMARY": {}
+  }
+}
+{code}
+
+----
+
+h3. 4.3 outputJSON (PCSM Response)
+
+Final block sizes:
+
+|| Block || Size ||
+| OCONTROL | 8 |
+| APPLDATA | 389 |
+| ADDEQDER | 92 |
+| EQUBUR | 682 |
+| EQUDERIV | 60 |
+| ERA1DATA | 52 |
+| ERA2DATA | 52 |
+| EXPBUR | 264 |
+| EXPDERIV | 101 |
+| FHRDATA | 42 |
+| PARAMTER | 5302 |
+| RESULTS | 2455 |
+| SUMMARY | 164 |
+| TAC3INC | 19 |
+| TACDATA | 6 |
+| TRIUMPH | 199 |
+| UCLDATA | 22 |
+| VECTUS | 85 |
+| MULTIQT | 241 |
+| MQRESULT | 267 |
+| MQSUMMARY | 61 |
+
+----
+
+h2. 5. Sequence Execution
+
+Each block is processed via Task (Callable):
+
+Example:
+- SdsParameterTask
+- Other BodySequence Tasks
+
+Key points:
+- Uses Callable + Executor
+- MDC used for logging
+- Each block handled independently
+
+----
+
+h2. 6. PARAMTER Block Handling (Critical Section)
+
+- PARAMTER block size = 5302 fields
+- Comes from DB (VecSdsparam table)
+- Mapped using SdsParameterMapper
+
+Flow:
+
+{code}
+DB (VecSdsparam)
+   ↓
+VecSdsparamRepository
+   ↓
+VecSdsparamDao
+   ↓
+SdsParameterMapper
+   ↓
+Paramter Object
+   ↓
+Set into DAJSONDocument
+{code}
+
+----
+
+h2. 7. Mapper Issue & Solution
+
+Problem:
+- MapStruct fails due to large size (5302 fields)
+
+Solution:
+- Generated Mapper Interface via script
+- Manually created Impl class
+- @Mapping annotations commented
+
+----
+
+h2. 8. CSV Driven Mapper Generation
+
+h3. CSV Format
+
+{code}
+logicalName,externalName,Type,Length,Scale,ArraySize,DateFormat
+{code}
+
+Supports:
+- Integer
+- String
+- Decimal
+- Array
+- Date
+
+----
+
+h3. Mapper Generation Process
+
+Steps:
+
+1. Place CSV file:
+PARAMTER-UPDATED.csv (5303 lines)
+
+2. Run Generator:
+
+{expand:title=Mapper Generator Script}
+(paste your SdsParameterJsonMapperGeneratorNew.java here)
+{expand}
+
+3. Output:
+- SdsParameterJsonMapper.java
+
+----
+
+h3. Impl Generation Process
+
+{expand:title=Impl Generator Script}
+(paste your SdsParameterJsonMapperImplGenerator.java here)
+{expand}
+
+Output:
+- SdsParameterJsonMapperImpl.java
+
+----
+
+h3. Execution Steps
+
+{code}
+1. Update CSV file path in script
+2. Compile:
+   javac SdsParameterJsonMapperGeneratorNew.java
+3. Run:
+   java SdsParameterJsonMapperGeneratorNew
+4. Repeat for Impl generator
+{code}
+
+----
+
+h2. 9. Exception Handling
+
+h3. Flow
+
+{code}
+Exception → ControllerAdvice → Error Enum → Response
+{code}
+
+h3. Classes
+
+- ControllerExceptionHandler
+- StrategicDecisionException
+- StrategicDecisionErrors
+- IllegalDatablockException
+
+h3. Notes
+
+- correlationId used for logging
+- Enum-based error mapping
+- No code changes required
+
+----
+
+h2. 10. Logging
+
+- Uses MDC
+- Tracks:
+  - productAppId
+  - correlationId
+  - execution time
+
+----
+
+h2. 11. Database Layer
+
+Repositories:
+
+- If024JsonDtlsRepository
+- ThmdeaudRepository
+- ThmderesRepository
+- VecSdsparamRepository
+
+Used for:
+- Request storage
+- Response storage
+- Parameter fetching
+
+----
+
+h2. 12. Extract Generation
+
+(To be documented separately)
+
+----
+
+h2. 13. SMPOJO Jar Creation (GitLab)
+
+Process:
+
+- SMPOJO contains DAJSONDocument classes
+- Used for request/response mapping
+
+Steps:
+
+1. Build using GitLab pipeline
+2. Generate JAR
+3. Upload to Nexus
+4. Add dependency in project
+
+(Add Confluence URL here)
+
+----
+
+h2. 14. Adding New Block
+
+If new block added:
+
+Update:
+
+1. DAJSONDocument class
+2. Mapper class
+3. Task class
+4. Sequence config
+5. CSV (if parameter related)
+6. PCSM integration mapping
+
+----
+
+h2. 15. Key Takeaways
+
+- Flow is DB → Mapper → PCSM → Response
+- PARAMTER is most complex block
+- CSV + Generator used for scalability
+- Manual Impl required due to MapStruct limitation
+- Exception handling centralized
+
+----
+
+h2. 16. KT Quick Summary
+
+{code}
+shortJSON → Build Input → Add PARAMTER → Call PCSM → Get Output → Build Response
+{code}
+
+----
