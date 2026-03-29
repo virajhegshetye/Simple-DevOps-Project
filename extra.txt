@@ -1,0 +1,736 @@
+h1. Decision Engine API â€“ Knowledge Transfer Document
+
+----
+
+{panel:title=Flow Summary|borderColor=#0052CC|titleBGColor=#0052CC|titleColor=#FFFFFF}
+DB â†’ BLOB to Map â†’ PcsmRequest â†’ 20 Parallel Tasks â†’ PCSM Engine â†’ BControl Check â†’ Extract â†’ Store â†’ Response
+{panel}
+
+This application is a *Decision Engine Integration System* built using Spring Boot. It integrates with the Experian PCSM Decision Agent to perform credit decisioning for card applications.
+
+----
+
+h2. 1. High Level Overview
+
+*What this system does:*
+* Fetch request JSON from Database (BLOB)
+* Transform JSON into structured data blocks
+* Execute Decision Engine (PCSM / Experian DA)
+* Store response back to Database
+* Return final response to caller
+
+*Technology Stack:*
+||Component||Technology||
+|Framework|Spring Boot|
+|JSON Processing|FastJSON2|
+|Database|Oracle (JdbcTemplate + JPA)|
+|Decision Engine|Experian PCSM (NTJSEMJSONInterface)|
+|Parallel Execution|ExecutorService (ThreadPoolTaskExecutor)|
+|Object Mapping|MapStruct|
+
+----
+
+h2. 2. End-to-End Flow
+
+h3. Step 1 â€“ Controller Layer
+
+{panel:title=DecisionController|borderColor=#0052CC|titleBGColor=#E6F0FF}
+*Class:* {{DecisionController}}
+*Endpoint:* {{POST /decision}}
+
+{code:java}
+@PostMapping(value = "/decision", produces = "application/json")
+public Response getDecision(
+    @RequestBody StrategyManagerRequest strategyManagerRequest,
+    @RequestHeader(required = true,  value = CORRELATION_ID) String correlationId,
+    @RequestHeader(required = false, value = CHANNEL_ID)     String channelName,
+    @RequestHeader(required = false, value = SUBCHANNEL_ID)  String subChannelName)
+{code}
+
+*What it does:*
+# Validates message type â€” must be {{DES_REQUEST}}, else throws {{BAD_REQUEST}}
+# Extracts {{productAppId}} from request body
+# Starts SLA timer via {{StrategicDecisionTime}}
+# Sets MDC context for distributed log tracing
+# Delegates to {{DecisionServiceImpl.callDecisionEngine()}}
+
+{code:java}
+MDC.put(PRODUCT_APP_ID, productAppId);
+MDC.put(CORRELATION_ID, correlationId);
+{code}
+
+{info}Controller is intentionally thin â€” validation and delegation only.{info}
+{panel}
+
+----
+
+h3. Step 2 â€“ DecisionServiceImpl (Main Orchestrator)
+
+{panel:title=callDecisionEngine() â€“ Core Method|borderColor=#FF5733|titleBGColor=#FF5733|titleColor=#FFFFFF}
+This is the brain of the system. It controls the entire flow end-to-end.
+
+*Method signature:*
+{code:java}
+public Response callDecisionEngine(String correlationID, String productAppId)
+{code}
+
+*Orchestration sequence:*
+# {{fetchAndValidateRequest()}} â€” fetch from DB
+# {{processJsonData()}} â€” convert BLOB â†’ ConcurrentHashMap
+# {{createPcsmRequest()}} â€” build central data holder
+# {{executeParallelTasks()}} â€” run 20 tasks concurrently
+# {{validateFutureList()}} â€” verify all tasks completed
+# {{createInputJsonStream()}} â€” serialize to ByteArrayInputStream
+# {{executePcsmRequest()}} â€” call PCSM engine
+# {{addEntryToIf024JsonDtls()}} â€” optional audit store
+# {{handleSuccessfulResponse()}} â€” process output and return
+{panel}
+
+----
+
+h3. Step 3 â€“ Fetch Request from Database
+
+{expand:title=fetchAndValidateRequest()}
+{code:java}
+Map<String, Object> requestMap = databaseService.getDesRequest(productAppId);
+
+if (requestMap == null || requestMap.isEmpty()) {
+    throw new StrategicDecisionException(DES001, DES001_ERROR);
+}
+if (!SUCCESS.equals(requestMap.get(PARAM_PROCESSING_FLAG))
+        || requestMap.get(PARAM_REQUEST_JSON) == null) {
+    throw new StrategicDecisionException(DES001, DES001_ERROR_DETAILS);
+}
+{code}
+{expand}
+
+{panel:title=Stored Procedure: IF024_JSON_METHOD.PRODUCE_REQUEST}
+*Output Parameters returned:*
+||Parameter||Type||Description||
+|p_request_json|BLOB|Short JSON (16 data blocks)|
+|p_result_block|BLOB|Previous result data|
+|p_summary_block|BLOB|Previous summary data|
+|p_mqresult_block|BLOB|Multi-quote result|
+|p_mqsummary_block|BLOB|Multi-quote summary|
+|p_processing_flag|VARCHAR|Must be "SUCCESS"|
+|p_outmsg|VARCHAR|Error message if any|
+{panel}
+
+----
+
+h3. Step 4 â€“ Convert BLOB â†’ JSON Map
+
+{expand:title=processJsonData()}
+{code:java}
+Map<String, Object> parsedData = commonUtils.parseObject(
+    blockDataInBlob.getBinaryStream(), Map.class
+);
+
+ConcurrentHashMap<String, Object> jsonAsMap = new ConcurrentHashMap<>(parsedData);
+
+if (jsonAsMap.size() != EXPECTED_JSON_MAP_SIZE) { // must be 1
+    throw new StrategicDecisionException(DES004, DES004_ERROR);
+}
+{code}
+{expand}
+
+{info}
+{{EXPECTED_JSON_MAP_SIZE = 1}} (defined in {{ApiConstants}}) â€” the outer map always has exactly one top-level key. The 16 data blocks are nested inside it.
+{info}
+
+----
+
+h3. Step 5 â€“ Create PcsmRequest
+
+{expand:title=createPcsmRequest()}
+{code:java}
+PcsmRequest pcsmRequest = applicationContext.getBean(PcsmRequest.class);
+
+pcsmRequest.setProductAppId(productAppId);
+pcsmRequest.setCorrelationID(correlationID);
+pcsmRequest.setJsonAsMap(jsonAsMap);
+pcsmRequest.setSummaryDataInBlob(summary);
+pcsmRequest.setResultDataInBlob(result);
+pcsmRequest.setMqSummaryDataInBlob(mqSummary);
+pcsmRequest.setMqResultDataInBlob(mqResult);
+
+// Extract from SPAREFIELD
+Map<String, Object> spareFieldMap = (Map<String, Object>) jsonAsMap.get(SPAREFIELD);
+
+// seqNumber â€” throws DES100 if missing
+pcsmRequest.setSeqNumber(Long.parseLong((String) spareFieldMap.get(SEQ_NUMBER)));
+
+// parameterChangeDateTime â€” throws DES100 if missing
+LocalDateTime parameterChangeDateTime = LocalDateTime.parse(
+    (String) spareFieldMap.get(PARAMCHNGEDATETIME),
+    DateTimeFormatter.ofPattern(DATE_TIME_FORMAT)  // "yyyy-MM-dd'T'HH:mm:ss"
+);
+pcsmRequest.setParameterChangeDateTime(parameterChangeDateTime);
+{code}
+{expand}
+
+{panel:title=PcsmRequest â€” Central Data Holder}
+{{PcsmRequest}} is passed across the entire flow. It holds:
+* {{productAppId}} / {{correlationID}}
+* {{jsonAsMap}} â€” ConcurrentHashMap of all block data from DB
+* {{daJsonDocument}} â€” final strongly-typed structure sent to PCSM
+* {{executionErrorMsg}} â€” Map collecting per-task errors (never throws from tasks)
+* {{seqNumber}} / {{parameterChangeDateTime}} â€” extracted from SPAREFIELD
+
+The constructor auto-creates {{DAJSONDocument}} and initialises {{Ocontrol}} with default values (alias: BCARDCC, signature: HAMLET).
+{panel}
+
+----
+
+h3. Step 6 â€“ Execute 20 Parallel Tasks
+
+{expand:title=executeParallelTasks()}
+{code:java}
+List<Callable<PcsmRequest>> callableTaskList = new ArrayList<>();
+
+PcsmConfiguration.getDatablocknames().forEach(dataBlockName -> {
+    try {
+        callableTaskList.add(
+            (Callable<PcsmRequest>) applicationContext.getBean(dataBlockName, pcsmRequest)
+        );
+    } catch (BeansException e) {
+        throw new StrategicDecisionException(DES002,
+            "Error building Request Block " + dataBlockName);
+    }
+});
+
+if (callableTaskList.size() != EXPECTED_TASK_COUNT) {  // must be 20
+    throw new StrategicDecisionException(DES002, "Invalid task count");
+}
+
+return executor.invokeAll(callableTaskList,
+    pcsmConfiguration.getDesTimeoutInMilis(), TimeUnit.MILLISECONDS);
+{code}
+{expand}
+
+{panel:title=20 Data Block Tasks (DATABLOCKNAMES in PcsmConfiguration)|borderColor=#00875A|titleBGColor=#E3FCEF}
+||#||Bean Name (ApiConstants)||Task Class||
+|1|APPLDATA|ApplicationDataTask|
+|2|VECTUS|VectusTask|
+|3|EQUDERIV|EquDeriveTask|
+|4|FHRDATA|FhrDataTask|
+|5|ERA2DATA|ERA2Task|
+|6|ERA1DATA|ERA1Task|
+|7|EXPBUR|ExpBurTask|
+|8|EQUBUR|EquBurTask|
+|9|UCLDATA|UclDataTask|
+|10|PARAMTER|SdsParameterTask|
+|11|EXPDERIV|ExpDerivTask|
+|12|RESULTS|ResultDataTask|
+|13|TACDATA|TacDataTask|
+|14|TAC3INC|Tac3IncTask|
+|15|SUMMARY|SummaryTask|
+|16|ADDEQDER|AddEqDerTask|
+|17|TRIUMPH|TriumphDataTask|
+|18|MULTIQT|MultiQtTask|
+|19|MQRESULT|MqResultTask|
+|20|MQSUMARY|MqSummaryTask|
+{panel}
+
+{warning}
+Tasks are dynamically resolved using:
+{code:java}
+applicationContext.getBean(dataBlockName, pcsmRequest)
+{code}
+The bean name must exactly match the constant in {{ApiConstants}} and the entry in {{PcsmConfiguration.DATABLOCKNAMES}}. A mismatch throws DES002.
+{warning}
+
+----
+
+h3. Step 7 â€“ Validate Task Completion
+
+{expand:title=validateFutureList()}
+{code:java}
+if (futureList == null) {
+    throw new StrategicDecisionException(DES002, "futureList is null");
+}
+
+boolean allCompletedSuccessfully = futureList.stream()
+    .allMatch(f -> f.isDone() && !f.isCancelled());
+
+if (futureList.size() != EXPECTED_TASK_COUNT || !allCompletedSuccessfully) {
+    throw new StrategicDecisionException(DES002, "Error in futureList");
+}
+
+if (!pcsmRequest.getExecutionErrorMsg().isEmpty()) {
+    throw new StrategicDecisionException(DES002,
+        "Error in tasks: " + pcsmRequest.getExecutionErrorMsg());
+}
+{code}
+{expand}
+
+{info}
+Tasks never throw â€” they catch all exceptions internally and add to {{executionErrorMsg}}. Errors are only surfaced here after all 20 tasks have completed.
+{info}
+
+----
+
+h3. Step 8 â€“ How Each Task Works (Per Block)
+
+Each task follows the same internal pattern using {{AbstractDataBlockTask}}:
+
+# *Extract* â€” get block data from {{pcsmRequest.getJsonAsMap()}}
+# *Validate* â€” check block is not null/empty
+# *Merge defaults* â€” {{sequence.getAllDefaults()}} + input data
+# *Transform* â€” {{commonUtils.parseObject()}} â†’ strongly typed POJO
+# *Set* â€” {{pcsmRequest.getDaJsonDocument().setXxxBlock(obj)}}
+
+{expand:title=AbstractDataBlockTask â€” Base Pattern}
+{code:java}
+public abstract class AbstractDataBlockTask implements Callable<PcsmRequest> {
+
+    protected PcsmRequest pcsmRequest;
+    protected String blockName;
+
+    @Override
+    public PcsmRequest call() {
+        try {
+            Map<String, Object> blockData = extractBlockData();
+            validateBlockData(blockData);
+            Object blockObject = transformToObject(blockData);
+            setBlockInDocument(blockObject);
+            return pcsmRequest;
+        } catch (Exception e) {
+            LOGGER.error("Error processing block: {}", blockName, e);
+            pcsmRequest.getExecutionErrorMsg().add(blockName + ": " + e.getMessage());
+            return pcsmRequest;
+        }
+    }
+
+    protected abstract Map<String, Object> extractBlockData();
+    protected abstract void validateBlockData(Map<String, Object> data);
+    protected abstract Object transformToObject(Map<String, Object> data);
+    protected abstract void setBlockInDocument(Object blockObject);
+}
+{code}
+{expand}
+
+----
+
+h3. Step 9 â€“ CommonUtils (Core Utility)
+
+{panel:title=CommonUtils Responsibilities}
+||Responsibility||Method||Notes||
+|JSON Deserialisation|{{parseObject()}}|FastJSON2 with cached ObjectReader|
+|JSON Serialisation|{{toJSONBytes()}}|FastJSON2 with ThreadLocal context|
+|Default Merging|{{addDefaultValues()}}|Merges CSV defaults into input map|
+|Validation|{{areMapsSame()}}|Verifies structure against expected schema|
+{panel}
+
+*Performance optimisations:*
+* {{ObjectReader}} / {{ObjectWriter}} cached per type
+* ThreadLocal {{JSONWriter.Context}} â€” avoids re-initialisation per request
+* Direct binary write â€” ~50% faster than standard Jackson
+
+----
+
+h3. Step 10 â€“ Mapper Layer (MapStruct)
+
+{expand:title=Example Mapper Interface}
+{code:java}
+@Mapper(componentModel = "spring")
+public interface AddEqDerJsonMapper {
+
+    @Mapping(target = "fieldName", qualifiedBy = ObjectToBigDecimal.class)
+    @Mapping(target = "otherField", qualifiedBy = ObjectToString.class)
+    Addeqder toAddeqder(Map<String, Object> source);
+}
+{code}
+{expand}
+
+Custom qualifiers used across all mappers:
+* {{ObjectToString}}
+* {{ObjectToBigDecimal}}
+* {{ObjectToDouble}}
+* {{ObjectToArray}}
+
+MapStruct auto-generates the {{Impl}} class at compile time.
+
+{warning}
+*PARAMTER block exception:* ~5302 fields â€” MapStruct code generation fails at this size. A *manual* {{SdsParameterJsonMapperImpl}} is written and maintained instead.
+{warning}
+
+----
+
+h3. Step 11 â€“ Input JSON to PCSM
+
+{expand:title=DAJSONDocument â€” Full Structure}
+{code:json}
+{
+  "DAJSONDocument": {
+    "OCONTROL": {},
+    "APPLDATA": {},
+    "ADDEQDER": {},
+    "EQUBUR":   {},
+    "EQUDERIV": {},
+    "ERA1DATA": {},
+    "ERA2DATA": {},
+    "EXPBUR":   {},
+    "EXPDERIV": {},
+    "FHRDATA":  {},
+    "PARAMTER": {},
+    "RESULTS":  {},
+    "SUMMARY":  {},
+    "TAC3INC":  {},
+    "TACDATA":  {},
+    "TRIUMPH":  {},
+    "UCLDATA":  {},
+    "VECTUS":   {},
+    "MULTIQT":  {},
+    "MQRESULT": {},
+    "MQSUMARY": {}
+  }
+}
+{code}
+{expand}
+
+----
+
+h3. Step 12 â€“ Execute PCSM Engine
+
+{expand:title=executePcsmRequest()}
+{code:java}
+long result = NTJSEMJSONInterface.instance().execute(
+    inputJSON,
+    outputJSON,
+    pcsmConfiguration.getEncoding(),      // "Cp1252"
+    pcsmConfiguration.isOutputChanged(),   // false
+    pcsmConfiguration.getTraceFlags()      // 0
+);
+{code}
+{expand}
+
+{panel:title=PCSM Engine â€” NTJSEMJSONInterface (sp5 jar)|borderColor=#FF8B00|titleBGColor=#FFF0B3}
+* *Library:* Experian proprietary â€” comes from external {{sp5}} jar
+* *Input:* {{ByteArrayInputStream}} of full {{DAJSONDocument}} JSON
+* *Output:* {{ByteArrayOutputStream}} with updated JSON
+* *Return code:* 0 = Success / Non-zero = Error â†’ throws DES003
+
+*PcsmConfiguration values used:*
+* {{encoding}}: Cp1252
+* {{outputChanged}}: false
+* {{traceFlags}}: 0
+{panel}
+
+----
+
+h3. Step 13 â€“ Success Path After PCSM
+
+{panel:title=handleSuccessfulResponse() â€” Post-PCSM Sequence|borderColor=#00875A|titleBGColor=#E3FCEF}
+After PCSM returns result = 0, the following steps execute *in order*:
+
+# *Parse output* â€” {{commonUtils.parseObject(outputJSON, PcsmRequest.class)}}
+# *Enrich context* â€” set productAppId, correlationID, seqNumber+1, parameterChangeDateTime
+# *BControl validation* â€” {{checkBusinessControlErrors()}}
+# *Extract generation* â€” {{generateExtract()}} via {{ExtractService}}
+# *SLA validation* â€” {{validateTimeTakenByRequest()}}
+# *Store response* â€” {{databaseService.storeDesResponce()}}
+# *Build response* â€” {{createFinalResponse()}}
+{panel}
+
+{expand:title=checkBusinessControlErrors() â€” OCONTROL Validation}
+{code:java}
+Ocontrol ocontrol = pcsmResponse.getDaJsonDocument().getOcontrol();
+
+if (ocontrol != null
+        && ocontrol.getErrorcount() != null
+        && !"0".equals(ocontrol.getErrorcount().getValue())
+        && ocontrol.getError() != null
+        && !ocontrol.getError().getValue().isEmpty()) {
+
+    List<String> errorCodes = ocontrol.getError().getValue();
+    throw new StrategicDecisionException(DES003,
+        "BControl Error Code(s): " + String.join(", ", errorCodes));
+}
+{code}
+
+PCSM returns business rule errors inside the OCONTROL block. If {{ERRORCOUNT > 0}} and the error list is non-empty, the response is rejected with DES003.
+{expand}
+
+{expand:title=generateExtract() â€” via ExtractService}
+{code:java}
+boolean isExtractGenerated = extractService.generateExtract(pcsmResponse);
+
+if (!isExtractGenerated) {
+    throw new StrategicDecisionException(DES100, "Error While Generating Extract");
+}
+{code}
+
+Extract generation processes 15 data blocks from the PCSM response and stores results in {{THMDAUD}} (audit) and {{THMDERES}} (results) tables.
+{expand}
+
+{expand:title=storeDesResponse() â€” IF024_RESPONSE_INSERT}
+{code:java}
+databaseService.storeDesResponce(productAppId, pcsmResponse, outputJSON.toByteArray(), result, SUCCESS);
+{code}
+
+*Stored Procedure:* {{IF024_JSON_METHOD.IF024_RESPONSE_INSERT}}
+
+Stores: summary block, results block, MQ blocks, control block, full response JSON, PCSM return code.
+
+Optional full JSON stored in {{if024_json_dtls}} when {{pcsmConfiguration.isStoreDataBlock() = true}}.
+{expand}
+
+----
+
+h2. 3. Error Handling Strategy
+
+h3. Error Codes
+
+||Error Code||Trigger||
+|DES001|DB fetch returns null/empty, processing flag not SUCCESS, DB store failure|
+|DES002|Task bean not found, task list size mismatch, task execution errors in any block|
+|DES003|PCSM non-zero return, BControl errors, SLA timeout exceeded, response parse failure|
+|DES004|BLOB null/empty, JSON parse failure, JSON map size != 1|
+|DES100|Missing seqNumber or paramChangeDateTime in SPAREFIELD, extract generation failure|
+|BAD_REQUEST|Message type not DES_REQUEST|
+|PCSM_ERROR|Uncaught unexpected exception|
+
+h3. Error Isolation
+
+{panel:title=Three-Level Error Handling}
+*Level 1 â€” Service Layer (DecisionServiceImpl)*
+{code:java}
+} catch (SQLException e) {
+    this.storeErrorResponse(productAppId);
+    throw new StrategicDecisionException(DES001, errorMessage);
+} catch (StrategicDecisionException e) {
+    this.storeErrorResponse(productAppId);
+    throw switch (e.getStrategicDecisionErrors().getCode()) {
+        case "DES002" -> new StrategicDecisionException(DES002, e.getErrorMessage());
+        case "DES003" -> new StrategicDecisionException(DES003, e.getErrorMessage());
+        // ... etc
+        default       -> new StrategicDecisionException(DES001, e.getErrorMessage());
+    };
+} catch (Exception e) {
+    if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+    this.storeErrorResponse(productAppId);
+    throw new StrategicDecisionException(PCSM_ERROR, errorMessage);
+}
+{code}
+
+*Level 2 â€” Task Level (per block)*
+Exceptions caught inside each task. Error added to {{executionErrorMsg}} on {{PcsmRequest}}. Task always returns â€” never throws.
+
+*Level 3 â€” Validation*
+Missing fields or structure mismatches caught by {{CommonUtils.areMapsSame()}} and {{validateFutureList()}}.
+{panel}
+
+----
+
+h2. 4. Application Startup Flow (@PostConstruct)
+
+@PostConstruct is used to initialise data *before any request is processed*.
+
+h3. Three components that run @PostConstruct
+
+{panel:title=4.1 Application.warmUp()|borderColor=#0052CC|titleBGColor=#E6F0FF}
+{code:java}
+@PostConstruct
+public void warmUp() throws IOException, JSONException {
+    // Load warmUp.json from classpath
+    // Run JSON parse + toJSONBytes 5 times (JIT warm-up)
+    // Call NTJSEMJSONInterface.execute() with dummy data
+    // Pre-cache common types via CommonUtils.warmUp()
+}
+{code}
+
+*Purpose:*
+* Avoid first-request latency (cold start ~2500ms â†’ warm ~500ms)
+* Trigger JIT compilation on hot serialisation paths
+* Initialise PCSM native libraries before production traffic
+* Pre-cache {{ObjectReader}} / {{ObjectWriter}} per domain type
+{panel}
+
+{panel:title=4.2 BodySequence Classes â€” All 20 Blocks|borderColor=#00875A|titleBGColor=#E3FCEF}
+Each block has a corresponding BodySequence class (e.g. {{AddEqDerBlockBodySequence}}, {{ApplicationDataBlockBodySequence}}).
+
+{code:java}
+@PostConstruct
+public void init() {
+    List<XxxConfigRecord> configRecords = loadObjectList(XxxConfigRecord.class, "BLOCKNAME.csv");
+
+    // Ordered field list for extract generation
+    sequence = configRecords.stream()
+        .map(XxxConfigRecord::getExternalName)
+        .collect(Collectors.toUnmodifiableList());
+
+    // Default values map for merge operations
+    defaults = configRecords.stream()
+        .collect(Collectors.toMap(
+            XxxConfigRecord::getExternalName,
+            element -> getDefaults(element)
+        ));
+}
+{code}
+
+*Why:* Avoids CSV I/O on every request. All 20 schemas are ready in memory before execution begins.
+{panel}
+
+{panel:title=4.3 SdsParameterMapperImpl â€” PARAMTER Block|borderColor=#FF8B00|titleBGColor=#FFF0B3}
+{code:java}
+@PostConstruct
+public void init() {
+    // Fetch ~5302 parameters from DB (VEC_SDSPARAM)
+    // Convert to Map with index-based array handling
+    // Validate against default schema
+    // Map to Paramter object (manual Impl â€” MapStruct fails at this size)
+    // Cache in PcsmInitDataBlock for reuse across all requests
+}
+{code}
+
+*Why:* Parameter block is too large to rebuild per request. Loaded once and held in {{PcsmInitDataBlock}}.
+{panel}
+
+----
+
+h2. 5. Parameter Block (Special Case)
+
+{warning}
+*PARAMTER block is handled differently from all other blocks.*
+
+* ~5302 fields
+* Source: {{VEC_SDSPARAM}} table (not from short JSON BLOB)
+* Loaded at startup via {{SdsParameterMapperImpl}} @PostConstruct
+* Cached in {{PcsmInitDataBlock}} (in-memory, shared across requests)
+* MapStruct auto-generation fails at this field count â€” manual {{SdsParameterJsonMapperImpl}} used instead
+{warning}
+
+----
+
+h2. 6. CSV + Config-Driven Design
+
+Each block is defined by a CSV file in {{src/main/resources/configs/}}:
+
+{code}
+logicalName,externalName,Type,Length,Scale,ArraySize,DateFormat
+Eq_Bu_Ins_Acc_15_exp,addeqderEqBuInsAcc15Exp,Integer,9,0,0,
+{code}
+
+The CSV drives:
+* Field names and data types
+* Default values per field
+* Array handling (index-based)
+* Field order for extract generation
+
+The {{Sequence}} interface provides:
+* {{getAllDefaults()}} â€” used in task merge step
+* {{get()}} â€” ordered field list for extract
+* {{getConfigRecord()}} â€” metadata lookup per field
+* {{loadObjectList()}} â€” default CSV loading utility
+
+----
+
+h2. 7. Database Layer
+
+||Type||Usage||
+|{{JdbcTemplate}}|Stored procedure calls|
+|JPA Repositories|Direct table access|
+
+*Stored Procedures:*
+* {{IF024_JSON_METHOD.PRODUCE_REQUEST}} â€” fetch input request
+* {{IF024_JSON_METHOD.IF024_RESPONSE_INSERT}} â€” store response
+
+*Tables:*
+||Table||Purpose||
+|{{if024_json_dtls}}|Optional full JSON audit store (when storeDataBlock=true)|
+|{{thmdeaud}}|Audit trail (populated by ExtractService)|
+|{{thmderes}}|Latest decision results (populated by ExtractService)|
+|{{vec_sdsparam}}|Source for PARAMTER block (5302 fields)|
+
+----
+
+h2. 8. External Dependencies
+
+{panel:title=SMPOJO Jar}
+* Contains: {{DAJSONDocument}} and all block model classes ({{Appldata}}, {{Addeqder}}, {{Vectus}}, etc.)
+* Built via GitLab CI pipeline from CSV + code generation
+* Used as a Maven compile dependency in this project
+* Must be rebuilt and version-bumped whenever a new block is added
+{panel}
+
+{panel:title=sp5 (DA Jar) â€” Experian Proprietary}
+* Contains: {{NTJSEMJSONInterface}}
+* Provides the actual PCSM decision engine execution interface
+* Not open-source â€” supplied by Experian
+{panel}
+
+----
+
+h2. 9. Key Design Highlights
+
+||Principle||Implementation||
+|Config-driven|CSV files define all block schemas â€” no hardcoded field lists|
+|Dynamic execution|{{applicationContext.getBean(blockName, pcsmRequest)}} â€” tasks resolved by name|
+|Parallel processing|{{ExecutorService.invokeAll()}} â€” all 20 blocks run concurrently|
+|High performance|FastJSON2 + ThreadLocal caching â€” ~50% faster than Jackson|
+|Startup optimisation|@PostConstruct in 3 places â€” schemas, parameters, and engine all pre-warmed|
+|Error isolation|Tasks never throw â€” errors collected in {{executionErrorMsg}} and validated after all tasks finish|
+
+----
+
+h2. 10. Adding a New Block â€” Complete Checklist
+
+{warning}
+*All 9 changes below are required.* Missing any one will cause failures â€” some silent.
+{warning}
+
+||#||Where||What to Change||Risk if Skipped||
+|1|*SMPOJO jar*|Add new block model class + add field to {{DAJSONDocument}}. Rebuild GitLab pipeline, update dependency version.|Compile error â€” block type unavailable|
+|2|*ApiConstants.java*|Add new block name constant *AND* increment {{EXPECTED_TASK_COUNT}} (currently 20)|Task count check throws DES002 â€” misleading error, hard to debug|
+|3|*PcsmConfiguration.java*|Add new constant to {{DATABLOCKNAMES}} list|Block silently never executes â€” no error thrown|
+|4|*resources/configs/*|Add {{NEWBLOCK.csv}} with field schema|BodySequence @PostConstruct fails at startup|
+|5|*block.config/*|Add {{NewBlockConfigRecord.java}}|CSV to Java mapping unavailable|
+|6|*encoder.converter/block/*|Add {{NewBlock.java}}|Encoder/converter layer incomplete|
+|7|*sequence/*|Add {{NewBlockBodySequence.java}} with @PostConstruct|No defaults available â€” task merge step fails|
+|8|*model/mapper/*|Add {{NewBlockJsonMapper.java}} (MapStruct interface)|Map â†’ POJO conversion unavailable|
+|9|*service/impl/executorTasks/*|Add {{NewBlockTask.java}} (@Component, @Scope PROTOTYPE)|Spring {{getBean()}} throws BeansException â†’ DES002|
+
+{info}
+*On #2 specifically:* {{EXPECTED_TASK_COUNT}} is in {{ApiConstants}}, not {{DecisionServiceImpl}}. It is checked in both {{executeParallelTasks()}} and {{validateFutureList()}}. Forgetting to increment it causes DES002 with "Invalid task count" even when everything else is correctly wired.
+{info}
+
+*Corrected killer line for KT:*
+{quote}
+"Each block follows a consistent 9-step pattern. Once you understand one block end-to-end, implementing any new block is mechanical â€” core orchestration code never changes."
+{quote}
+
+----
+
+h2. 11. Important Notes
+
+{warning}
+* Extract generation *IS* part of this flow â€” it runs inside {{handleSuccessfulResponse()}} after PCSM execution
+* PARAMTER block is handled separately (DB-loaded, cached at startup, manual mapper)
+* Tasks are dynamically loaded by Spring â€” bean name must exactly match {{ApiConstants}} constant and {{DATABLOCKNAMES}} entry
+* {{EXPECTED_TASK_COUNT}} must be updated in {{ApiConstants}} when adding any new block
+* {{PcsmInitDataBlock}} is the in-memory cache that holds startup-loaded parameter data for reuse across all requests
+{warning}
+
+----
+
+h2. 12. Complete Flow in 30 Seconds
+
+{panel:title=One-line summary for KT presentation|borderColor=#0052CC|titleBGColor=#0052CC|titleColor=#FFFFFF}
+"This system fetches a short JSON from DB, runs 20 parallel tasks to transform each data block, sends the full DAJSONDocument to the PCSM engine, validates the result, generates an extract for mainframe, stores the response, and returns the decision to the caller."
+{panel}
+
+*Killer lines for presentation:*
+{quote}
+"{{DecisionServiceImpl}} is the brain â€” everything else is plugged into it."
+
+"Tasks are not hardcoded. Spring resolves them dynamically by block name at runtime."
+
+"Adding a new block is a 9-step pattern â€” core orchestration never changes."
+
+"@PostConstruct runs in three places â€” schemas, parameter block, and engine are all warm before the first request hits."
+
+"Each task owns its error. One block failing doesn't break the rest."
+
+"If you forget to increment {{EXPECTED_TASK_COUNT}} when adding a new block, you'll get a DES002 with no obvious reason why."
+{quote}
