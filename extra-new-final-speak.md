@@ -136,13 +136,15 @@
 
 # 12. PARAMTER Mapper Generation
 
-“Since PARAMTER has 5302 fields, mapper is generated using scripts.”
+“Since PARAMTER has around 5300 fields, MapStruct cannot generate it.”
 
-“We run generator Java file to create mapper interface.”
+“So we use custom Java generator scripts.”
 
-“Then run another script to generate implementation class.”
+“We first prepare the CSV, then run mapper generator, then run impl generator.”
 
-“We never modify generated code manually.”
+“Generated files are moved to mapper package and used by SdsParameterMapperImpl.”
+
+“Important — we never modify generated files manually.”
 
 ---
 
