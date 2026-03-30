@@ -6,24 +6,44 @@ h1. Decision Engine API - Knowledge Transfer Document
 
 h2. 1. Overview
 
-This API acts as a Decision Engine orchestration layer:
+- Fetches request (shortJSON) from DB  
+- Builds DAJSONDocument (PCSM input)  
+- Executes blocks in parallel  
+- Calls PCSM (NTJSEMJSONInterface - sp5 jar)  
+- Performs post-processing  
+- Stores response in DB  
+- Returns summarized response  
 
-- Fetches request (shortJSON) from DB
-- Builds DAJSONDocument (PCSM input)
-- Executes all blocks in parallel
-- Calls PCSM (NTJSEMJSONInterface - sp5 jar)
-- Performs post-processing
-- Stores response in DB
-- Returns final summarized response
-
-*Notes:*
-- Core class: DecisionServiceImpl
-- Models from SMPOJO jar
-- PCSM call via sp5 jar
+{info}
+Core class: DecisionServiceImpl  
+SMPOJO jar → DAJSONDocument and models  
+sp5 jar → NTJSEMJSONInterface for PCSM execution  
+{info}
 
 ----
 
-h2. 2. End-to-End Flow (Actual Code Execution)
+h2. 2. Controller Layer (DecisionController)
+
+# Validates request type using *DesType.isRequest()*  
+# Extracts *productAppId*  
+# Starts SLA timer (*StrategicDecisionTime*)  
+# Sets MDC context (*productAppId*, *correlationId*)  
+# Delegates to *DecisionServiceImpl.callDecisionEngine()*  
+# Logs total execution time  
+
+{code:java}
+MDC.put(PRODUCT_APP_ID, productAppId);
+MDC.put(CORRELATION_ID, correlationId);
+{code}
+
+{info}
+MDC enables request-level log tracing across parallel execution.  
+Controller handles only validation, timing, and delegation.  
+{info}
+
+----
+
+h2. 3. End-to-End Flow
 
 {code}
 Client Request
@@ -65,22 +85,23 @@ createFinalResponse()
 Return Response
 {code}
 
-*Notes:*
-- No aggregation step — tasks update PcsmRequest directly
-- Audit entry happens after PCSM execution
+{info}
+Tasks directly update PcsmRequest (no aggregation layer).  
+All post-PCSM steps are mandatory.  
+{info}
 
 ----
 
-h2. 3. Build Phase
+h2. 4. Build Phase
 
 {code}
 Gradle Build
    ↓
-Load Dependencies:
-   - SMPOJO jar (DAJSONDocument + models)
-   - sp5 jar (NTJSEMJSONInterface)
+Dependencies:
+   SMPOJO jar (models)
+   sp5 jar (PCSM interface)
    ↓
-Compile Code
+Compilation
    ↓
 MapStruct Processing
    ↓
@@ -89,101 +110,84 @@ Manual PARAMTER Mapper
 Jar Packaging
 {code}
 
-*Notes:*
-- PARAMTER mapper is manually generated (5302 fields)
-- MapStruct fails for large block
+{info}
+PARAMTER mapper is manually generated due to 5302 fields.  
+{info}
 
 ----
 
-h2. 4. Application Startup & Warmup
+h2. 5. Application Startup & Warmup
 
 {code}
 Spring Boot Start
-   ↓
-Bean Initialization
    ↓
 @PostConstruct (Application.warmUP)
    ↓
 JSON + CommonUtils Warmup
    ↓
-PCSM Warmup Call
-   ↓
-Class Preloading
+PCSM Warmup Execution
    ↓
 Application Ready
 {code}
 
-*Notes:*
-- Warmup avoids first-call latency
-- Includes PCSM execution warmup
+{info}
+Warmup ensures no latency on first API call.  
+{info}
 
 ----
 
-h2. 5. PARAMTER Caching (Critical)
-
-h3. Startup Flow
+h2. 6. PARAMTER Caching
 
 {code}
-Application Start
+Application Startup
    ↓
-SdsParameterMapperImpl.@PostConstruct
+SdsParameterMapperImpl (@PostConstruct)
    ↓
-Fetch vec_sdsparam
+Fetch data from vec_sdsparam
    ↓
-Map to PARAMTER block
+Map to PcsmInitDataBlock
    ↓
-Store in PcsmInitDataBlock (Cache)
-{code}
+Store in memory (cache)
 
-h3. Runtime Flow
-
-{code}
-Request
+Request Flow
    ↓
 SdsParameterTask
    ↓
-Read from PcsmInitDataBlock
+Reads from PcsmInitDataBlock (based on parameterChangeDateTime)
    ↓
-Set into DAJSONDocument
+Sets PARAMTER into DAJSONDocument
 {code}
 
-*Notes:*
-- PARAMTER is cached in memory
-- NOT fetched per request
-- Driven by parameterChangeDateTime
+{info}
+PARAMTER is loaded once at startup and stored in memory.  
+During request processing, no DB call is made — data is read from cache using parameterChangeDateTime.  
+{info}
 
 ----
 
-h2. 6. Parallel Execution (Actual Implementation)
+h2. 7. Parallel Execution
 
 {code}
-Request
-   ↓
-Create 20 Callable Tasks
+Create Callable Tasks (20 blocks)
    ↓
 executor.invokeAll(tasks, timeout)
    ↓
 validateFutureList()
    ↓
-Tasks directly update PcsmRequest
+Tasks update PcsmRequest
    ↓
 DAJSONDocument ready
 {code}
 
-*Notes:*
-- No Future.get()
-- No aggregation layer
-- Shared mutable PcsmRequest
-- Validation checks:
-  - isDone()
-  - !isCancelled()
-  - executionErrorMsg empty
+{info}
+No Future.get() calls.  
+No aggregation step.  
+Shared PcsmRequest object is updated by all tasks.  
+{info}
 
 ----
 
-h2. 7. Data Blocks (PcsmConfiguration)
-
-Total Blocks = 20
+h2. 8. Data Blocks
 
 {code}
 APPLDATA, VECTUS, EQUDERIV, FHRDATA, ERA2DATA,
@@ -192,13 +196,15 @@ EXPDERIV, RESULTS, TACDATA, TAC3INC, SUMMARY,
 ADDEQDER, TRIUMPH, MULTIQT, MQRESULT, MQSUMMARY
 {code}
 
-*Notes:*
-- EXPECTED_TASK_COUNT = 20
-- Must match exactly
+{info}
+Total blocks = 20  
+Must match EXPECTED_TASK_COUNT  
+Mismatch results in DES002 error  
+{info}
 
 ----
 
-h2. 8. JSON Structures
+h2. 9. JSON Structures
 
 h3. shortJSON
 
@@ -208,25 +214,13 @@ h3. shortJSON
 {code}
 {expand}
 
-*Notes:*
-- Comes from DB
-- Input to system
-
-----
-
-h3. inputJSON (DAJSONDocument)
+h3. inputJSON
 
 {expand:title=inputJSON}
 {code:json}
 <PASTE FULL inputJSON>
 {code}
 {expand}
-
-*Notes:*
-- Built by parallel tasks
-- Sent to PCSM
-
-----
 
 h3. outputJSON
 
@@ -236,13 +230,9 @@ h3. outputJSON
 {code}
 {expand}
 
-*Notes:*
-- Returned from PCSM
-- Used for response + DB storage
-
 ----
 
-h3. Block Sizes
+h3. Block Sizes (from outputJSON)
 
 || Block || Size ||
 | OCONTROL | 8 |
@@ -267,12 +257,14 @@ h3. Block Sizes
 | MQRESULT | 267 |
 | MQSUMMARY | 61 |
 
-*Notes:*
-- PARAMTER largest + most critical
+{info}
+Exact sizes from PCSM output (DAJSONDocument).  
+PARAMTER is the largest and most critical block.  
+{info}
 
 ----
 
-h2. 9. PARAMTER Deployment
+h2. 10. PARAMTER Deployment
 
 {code}
 CSV → GitLab Pipeline → vec_sdsparam → Startup Cache → API
@@ -281,56 +273,38 @@ CSV → GitLab Pipeline → vec_sdsparam → Startup Cache → API
 Example:
 - if0144_par296_v1.csv
 
-*Notes:*
-- CSV must match mapper
-- DB mismatch = wrong output
+{info}
+CSV structure must match mapper and DB.  
+Mismatch leads to incorrect decision output.  
+{info}
 
 ----
 
-h2. 10. PARAMTER Mapper Generation
+h2. 11. PARAMTER Mapper Generation
 
-h3. Step 1 – CSV
-
-- PARAMTER-UPDATED.csv (5303 rows)
-
-----
-
-h3. Step 2 – Mapper Generator
+- CSV → Generator → Impl class
 
 {expand:title=SdsParameterJsonMapperGenerator.java}
 <PASTE FULL CODE>
 {expand}
 
-{code}
-javac SdsParameterJsonMapperGenerator.java
-java SdsParameterJsonMapperGenerator
-{code}
-
-----
-
-h3. Step 3 – Impl Generator
-
 {expand:title=SdsParameterJsonMapperImplGenerator.java}
 <PASTE FULL CODE>
 {expand}
 
-{code}
-javac SdsParameterJsonMapperImplGenerator.java
-java SdsParameterJsonMapperImplGenerator
-{code}
-
-*Notes:*
-- Never manually edit generated code
-- Always regenerate after CSV change
+{info}
+Generated files must not be edited manually.  
+Regenerate whenever CSV changes.  
+{info}
 
 ----
 
-h2. 11. Exception Handling
+h2. 12. Exception Handling
 
 {code}
 Exception
    ↓
-ControllerExceptionHandler
+ControllerAdvice
    ↓
 StrategicDecisionException
    ↓
@@ -339,83 +313,78 @@ storeErrorResponse()
 Return Error Response
 {code}
 
-Error Codes:
+- DES001 → DB error  
+- DES002 → Task failure  
+- DES003 → PCSM failure  
+- DES004 → JSON error  
+- DES100 → Business validation  
 
-- DES001 → DB failure
-- DES002 → Task failure
-- DES003 → PCSM failure
-- DES004 → JSON parsing error
-- DES100 → Business validation
-
-*Notes:*
-- Centralized handling
-- Always logs + stores error
+{info}
+All errors are logged and stored in DB.  
+{info}
 
 ----
 
-h2. 12. Database Interaction
+h2. 13. Database Layer
 
-Main Methods:
+- getDesRequest()  
+- storeDesResponce()  
+- addEntryInIf024JsonDtls()  
 
-- getDesRequest()
-- storeDesResponce()
-- addEntryInIf024JsonDtls()
-
-*Notes:*
-- Request + response persisted
-- Audit controlled by config flag
-
-Reference:
+Reference:  
 [Database Changes|<ADD_DB_URL>]
 
 ----
 
-h2. 13. SMPOJO
+h2. 14. SMPOJO
 
 {code}
 SM JSON → Merge → GitLab Pipeline → SMPOJO → API
 {code}
 
-*Notes:*
-- DAJSONDocument comes from SMPOJO
-- No manual modification in API
+{info}
+DAJSONDocument and all block models come from SMPOJO.  
+No manual changes in API.  
+{info}
 
-Reference:
+Reference:  
 [SMPOJO Creation|<ADD_SMPOJO_URL>]
 
 ----
 
-h2. 14. Adding New Block (Important)
+h2. 15. Adding New Block
 
-|| # || Location || Change || Risk ||
+|| Step || Change || Risk ||
 | 1 | SMPOJO | Model update | Block missing |
 | 2 | ApiConstants | Add constant + EXPECTED_TASK_COUNT | DES002 |
-| 3 | PcsmConfiguration | Add block | Task missing |
+| 3 | PcsmConfiguration | Add block | Task not created |
 | 4 | CSV | Add mapping | Wrong data |
-| 5 | Config | ConfigRecord | Init fail |
-| 6 | Block | Converter | Mapping fail |
-| 7 | Sequence | BodySequence | Not executed |
+| 5 | Config | ConfigRecord | Initialization failure |
+| 6 | Block | Converter | Mapping failure |
+| 7 | Sequence | BodySequence | Block not executed |
 | 8 | Mapper | JsonMapper | Missing values |
 | 9 | Task | Executor | Block skipped |
 
-*Notes:*
-- EXPECTED_TASK_COUNT mismatch = production failure
+{info}
+EXPECTED_TASK_COUNT mismatch is the most common production failure.  
+{info}
 
 ----
 
-h2. 15. Summary
+h2. 16. Summary
 
 {code}
 shortJSON → Parallel Tasks → Cached PARAMTER → PCSM → Post-processing → Response
 {code}
 
-*Notes:*
-- Parallel + Cache-based architecture
-- PARAMTER drives decision logic
+{info}
+Parallel execution and PARAMTER caching drive performance.  
+PARAMTER is the core decision driver.  
+{info}
 
 ----
 
-h2. 16. Important URLs
+h2. 17. Important URLs
 
 || Purpose || Link ||
 | SMPOJO Creation | <ADD_SMPOJO_URL> |
