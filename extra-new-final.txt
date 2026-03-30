@@ -1,0 +1,428 @@
+h1. Decision Engine API - Knowledge Transfer Document
+
+(toc:minLevel=1|maxLevel=4)
+
+----
+
+h2. 1. Overview
+
+This API acts as a Decision Engine orchestration layer:
+
+- Fetches request (shortJSON) from DB
+- Builds DAJSONDocument (PCSM input)
+- Executes all blocks in parallel
+- Calls PCSM (NTJSEMJSONInterface - sp5 jar)
+- Performs post-processing
+- Stores response in DB
+- Returns final summarized response
+
+*Notes:*
+- Core class: DecisionServiceImpl
+- Models from SMPOJO jar
+- PCSM call via sp5 jar
+
+----
+
+h2. 2. End-to-End Flow (Actual Code Execution)
+
+{code}
+Client Request
+   ↓
+DecisionController
+   ↓
+DecisionServiceImpl.callDecisionEngine()
+   ↓
+fetchAndValidateRequest()
+   ↓
+processJsonData()
+   ↓
+createPcsmRequest()
+   ↓
+executeParallelTasks()
+   ↓
+executor.invokeAll()
+   ↓
+validateFutureList()
+   ↓
+createInputJsonStream()
+   ↓
+executePcsmRequest()
+   ↓
+addEntryToIf024JsonDtls()
+   ↓
+handleSuccessfulResponse()
+      ↓
+      checkBusinessControlErrors()
+      ↓
+      generateExtract()
+      ↓
+      validateTimeTakenByRequest()
+      ↓
+      storeDesResponce()
+   ↓
+createFinalResponse()
+   ↓
+Return Response
+{code}
+
+*Notes:*
+- No aggregation step — tasks update PcsmRequest directly
+- Audit entry happens after PCSM execution
+
+----
+
+h2. 3. Build Phase
+
+{code}
+Gradle Build
+   ↓
+Load Dependencies:
+   - SMPOJO jar (DAJSONDocument + models)
+   - sp5 jar (NTJSEMJSONInterface)
+   ↓
+Compile Code
+   ↓
+MapStruct Processing
+   ↓
+Manual PARAMTER Mapper
+   ↓
+Jar Packaging
+{code}
+
+*Notes:*
+- PARAMTER mapper is manually generated (5302 fields)
+- MapStruct fails for large block
+
+----
+
+h2. 4. Application Startup & Warmup
+
+{code}
+Spring Boot Start
+   ↓
+Bean Initialization
+   ↓
+@PostConstruct (Application.warmUP)
+   ↓
+JSON + CommonUtils Warmup
+   ↓
+PCSM Warmup Call
+   ↓
+Class Preloading
+   ↓
+Application Ready
+{code}
+
+*Notes:*
+- Warmup avoids first-call latency
+- Includes PCSM execution warmup
+
+----
+
+h2. 5. PARAMTER Caching (Critical)
+
+h3. Startup Flow
+
+{code}
+Application Start
+   ↓
+SdsParameterMapperImpl.@PostConstruct
+   ↓
+Fetch vec_sdsparam
+   ↓
+Map to PARAMTER block
+   ↓
+Store in PcsmInitDataBlock (Cache)
+{code}
+
+h3. Runtime Flow
+
+{code}
+Request
+   ↓
+SdsParameterTask
+   ↓
+Read from PcsmInitDataBlock
+   ↓
+Set into DAJSONDocument
+{code}
+
+*Notes:*
+- PARAMTER is cached in memory
+- NOT fetched per request
+- Driven by parameterChangeDateTime
+
+----
+
+h2. 6. Parallel Execution (Actual Implementation)
+
+{code}
+Request
+   ↓
+Create 20 Callable Tasks
+   ↓
+executor.invokeAll(tasks, timeout)
+   ↓
+validateFutureList()
+   ↓
+Tasks directly update PcsmRequest
+   ↓
+DAJSONDocument ready
+{code}
+
+*Notes:*
+- No Future.get()
+- No aggregation layer
+- Shared mutable PcsmRequest
+- Validation checks:
+  - isDone()
+  - !isCancelled()
+  - executionErrorMsg empty
+
+----
+
+h2. 7. Data Blocks (PcsmConfiguration)
+
+Total Blocks = 20
+
+{code}
+APPLDATA, VECTUS, EQUDERIV, FHRDATA, ERA2DATA,
+ERA1DATA, UCLDATA, EXPBUR, EQUBUR, PARAMTER,
+EXPDERIV, RESULTS, TACDATA, TAC3INC, SUMMARY,
+ADDEQDER, TRIUMPH, MULTIQT, MQRESULT, MQSUMMARY
+{code}
+
+*Notes:*
+- EXPECTED_TASK_COUNT = 20
+- Must match exactly
+
+----
+
+h2. 8. JSON Structures
+
+h3. shortJSON
+
+{expand:title=shortJSON}
+{code:json}
+<PASTE FULL shortJSON>
+{code}
+{expand}
+
+*Notes:*
+- Comes from DB
+- Input to system
+
+----
+
+h3. inputJSON (DAJSONDocument)
+
+{expand:title=inputJSON}
+{code:json}
+<PASTE FULL inputJSON>
+{code}
+{expand}
+
+*Notes:*
+- Built by parallel tasks
+- Sent to PCSM
+
+----
+
+h3. outputJSON
+
+{expand:title=outputJSON}
+{code:json}
+<PASTE FULL outputJSON>
+{code}
+{expand}
+
+*Notes:*
+- Returned from PCSM
+- Used for response + DB storage
+
+----
+
+h3. Block Sizes
+
+|| Block || Size ||
+| OCONTROL | 8 |
+| APPLDATA | 389 |
+| ADDEQDER | 92 |
+| EQUBUR | 682 |
+| EQUDERIV | 60 |
+| ERA1DATA | 52 |
+| ERA2DATA | 52 |
+| EXPBUR | 264 |
+| EXPDERIV | 101 |
+| FHRDATA | 42 |
+| PARAMTER | 5302 |
+| RESULTS | 2455 |
+| SUMMARY | 164 |
+| TAC3INC | 19 |
+| TACDATA | 6 |
+| TRIUMPH | 199 |
+| UCLDATA | 22 |
+| VECTUS | 85 |
+| MULTIQT | 241 |
+| MQRESULT | 267 |
+| MQSUMMARY | 61 |
+
+*Notes:*
+- PARAMTER largest + most critical
+
+----
+
+h2. 9. PARAMTER Deployment
+
+{code}
+CSV → GitLab Pipeline → vec_sdsparam → Startup Cache → API
+{code}
+
+Example:
+- if0144_par296_v1.csv
+
+*Notes:*
+- CSV must match mapper
+- DB mismatch = wrong output
+
+----
+
+h2. 10. PARAMTER Mapper Generation
+
+h3. Step 1 – CSV
+
+- PARAMTER-UPDATED.csv (5303 rows)
+
+----
+
+h3. Step 2 – Mapper Generator
+
+{expand:title=SdsParameterJsonMapperGenerator.java}
+<PASTE FULL CODE>
+{expand}
+
+{code}
+javac SdsParameterJsonMapperGenerator.java
+java SdsParameterJsonMapperGenerator
+{code}
+
+----
+
+h3. Step 3 – Impl Generator
+
+{expand:title=SdsParameterJsonMapperImplGenerator.java}
+<PASTE FULL CODE>
+{expand}
+
+{code}
+javac SdsParameterJsonMapperImplGenerator.java
+java SdsParameterJsonMapperImplGenerator
+{code}
+
+*Notes:*
+- Never manually edit generated code
+- Always regenerate after CSV change
+
+----
+
+h2. 11. Exception Handling
+
+{code}
+Exception
+   ↓
+ControllerExceptionHandler
+   ↓
+StrategicDecisionException
+   ↓
+storeErrorResponse()
+   ↓
+Return Error Response
+{code}
+
+Error Codes:
+
+- DES001 → DB failure
+- DES002 → Task failure
+- DES003 → PCSM failure
+- DES004 → JSON parsing error
+- DES100 → Business validation
+
+*Notes:*
+- Centralized handling
+- Always logs + stores error
+
+----
+
+h2. 12. Database Interaction
+
+Main Methods:
+
+- getDesRequest()
+- storeDesResponce()
+- addEntryInIf024JsonDtls()
+
+*Notes:*
+- Request + response persisted
+- Audit controlled by config flag
+
+Reference:
+[Database Changes|<ADD_DB_URL>]
+
+----
+
+h2. 13. SMPOJO
+
+{code}
+SM JSON → Merge → GitLab Pipeline → SMPOJO → API
+{code}
+
+*Notes:*
+- DAJSONDocument comes from SMPOJO
+- No manual modification in API
+
+Reference:
+[SMPOJO Creation|<ADD_SMPOJO_URL>]
+
+----
+
+h2. 14. Adding New Block (Important)
+
+|| # || Location || Change || Risk ||
+| 1 | SMPOJO | Model update | Block missing |
+| 2 | ApiConstants | Add constant + EXPECTED_TASK_COUNT | DES002 |
+| 3 | PcsmConfiguration | Add block | Task missing |
+| 4 | CSV | Add mapping | Wrong data |
+| 5 | Config | ConfigRecord | Init fail |
+| 6 | Block | Converter | Mapping fail |
+| 7 | Sequence | BodySequence | Not executed |
+| 8 | Mapper | JsonMapper | Missing values |
+| 9 | Task | Executor | Block skipped |
+
+*Notes:*
+- EXPECTED_TASK_COUNT mismatch = production failure
+
+----
+
+h2. 15. Summary
+
+{code}
+shortJSON → Parallel Tasks → Cached PARAMTER → PCSM → Post-processing → Response
+{code}
+
+*Notes:*
+- Parallel + Cache-based architecture
+- PARAMTER drives decision logic
+
+----
+
+h2. 16. Important URLs
+
+|| Purpose || Link ||
+| SMPOJO Creation | <ADD_SMPOJO_URL> |
+| Database Changes | <ADD_DB_URL> |
+| GitLab | <ADD_GITLAB> |
+| Swagger | <ADD_SWAGGER> |
+| Nexus | <ADD_NEXUS> |
+| OpenShift | <ADD_OPENSHIFT> |
+
+----
