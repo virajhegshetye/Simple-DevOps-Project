@@ -14,11 +14,10 @@ h2. 1. Overview
 - Stores response in DB  
 - Returns summarized response  
 
-{info}
-Core class: DecisionServiceImpl  
-SMPOJO jar → DAJSONDocument and models  
-sp5 jar → NTJSEMJSONInterface for PCSM execution  
-{info}
+*Key Notes:*
+- Core class: DecisionServiceImpl  
+- SMPOJO jar → DAJSONDocument and models  
+- sp5 jar → PCSM execution  
 
 ----
 
@@ -36,10 +35,9 @@ MDC.put(PRODUCT_APP_ID, productAppId);
 MDC.put(CORRELATION_ID, correlationId);
 {code}
 
-{info}
-MDC enables request-level log tracing across parallel execution.  
-Controller handles only validation, timing, and delegation.  
-{info}
+*Key Notes:*
+- MDC enables request-level log tracing across parallel execution  
+- Controller handles only validation and delegation  
 
 ----
 
@@ -85,59 +83,32 @@ createFinalResponse()
 Return Response
 {code}
 
-{info}
-Tasks directly update PcsmRequest (no aggregation layer).  
-All post-PCSM steps are mandatory.  
-
-Extract generation is handled in *generateExtract()* using ExtractService.  
-Reference: [Extract Generation Process|<ADD_EXTRACT_URL>]
-{info}
+*Key Notes:*
+- Tasks directly update PcsmRequest (no aggregation)  
+- Extract generation handled in generateExtract()  
+- Reference: [Extract Generation Process|<ADD_EXTRACT_URL>]  
 
 ----
 
 h2. 4. Build Phase
 
 {code}
-Gradle Build
-   ↓
-Dependencies:
-   SMPOJO jar (models)
-   sp5 jar (PCSM interface)
-   ↓
-Compilation
-   ↓
-MapStruct Processing
-   ↓
-Manual PARAMTER Mapper
-   ↓
-Jar Packaging
+Gradle Build → SMPOJO jar → sp5 jar → Compile → MapStruct → Manual PARAMTER Mapper → Jar
 {code}
 
-{info}
-PARAMTER mapper is manually generated due to 5302 fields.  
-{info}
+*Key Notes:*
+- PARAMTER mapper is manually generated (5302 fields)  
 
 ----
 
 h2. 5. Application Startup & Warmup
 
 {code}
-Spring Boot Start
-   ↓
-Bean Initialization
-   ↓
-@PostConstruct (Application.warmUP)
-   ↓
-JSON + CommonUtils Warmup
-   ↓
-PCSM Warmup Execution
-   ↓
-Application Ready
+Spring Boot → @PostConstruct → JSON Warmup → PCSM Warmup → Ready
 {code}
 
-{info}
-Warmup ensures no latency on first API call.  
-{info}
+*Key Notes:*
+- Prevents first-request latency  
 
 ----
 
@@ -148,47 +119,31 @@ Application Startup
    ↓
 SdsParameterMapperImpl (@PostConstruct)
    ↓
-Fetch data from vec_sdsparam
-   ↓
-Map to PcsmInitDataBlock
-   ↓
-Store in memory (cache)
+vec_sdsparam → PcsmInitDataBlock (Cache)
 
 Request Flow
    ↓
 SdsParameterTask
    ↓
-Reads from PcsmInitDataBlock (based on parameterChangeDateTime)
-   ↓
-Sets PARAMTER into DAJSONDocument
+PcsmInitDataBlock → DAJSONDocument
 {code}
 
-{info}
-PARAMTER is loaded once at startup and stored in memory.  
-During request processing, no DB call is made — data is read from cache using parameterChangeDateTime.  
-{info}
+*Key Notes:*
+- Loaded once at startup  
+- No DB call during request  
+- Uses parameterChangeDateTime  
 
 ----
 
 h2. 7. Parallel Execution
 
 {code}
-Create Callable Tasks (20 blocks)
-   ↓
-executor.invokeAll(tasks, timeout)
-   ↓
-validateFutureList()
-   ↓
-Tasks update PcsmRequest
-   ↓
-DAJSONDocument ready
+20 Tasks → executor.invokeAll() → validateFutureList() → PcsmRequest updated
 {code}
 
-{info}
-No Future.get() calls.  
-No aggregation step.  
-Shared PcsmRequest object is updated by all tasks.  
-{info}
+*Key Notes:*
+- No Future.get()  
+- Shared PcsmRequest object  
 
 ----
 
@@ -201,11 +156,9 @@ EXPDERIV, RESULTS, TACDATA, TAC3INC, SUMMARY,
 ADDEQDER, TRIUMPH, MULTIQT, MQRESULT, MQSUMMARY
 {code}
 
-{info}
-Total blocks = 20  
-Must match EXPECTED_TASK_COUNT  
-Mismatch results in DES002 error  
-{info}
+*Key Notes:*
+- Total blocks = 20  
+- Must match EXPECTED_TASK_COUNT  
 
 ----
 
@@ -214,21 +167,21 @@ h2. 9. JSON Structures
 h3. shortJSON
 {expand:title=shortJSON}
 {code:json}
-<PASTE FULL shortJSON>
+<PASTE>
 {code}
 {expand}
 
 h3. inputJSON
 {expand:title=inputJSON}
 {code:json}
-<PASTE FULL inputJSON>
+<PASTE>
 {code}
 {expand}
 
 h3. outputJSON
 {expand:title=outputJSON}
 {code:json}
-<PASTE FULL outputJSON>
+<PASTE>
 {code}
 {expand}
 
@@ -259,10 +212,8 @@ h3. Block Sizes (from outputJSON)
 | MQRESULT | 267 |
 | MQSUMMARY | 61 |
 
-{info}
-Exact sizes from PCSM output (DAJSONDocument).  
-PARAMTER is the largest and most critical block.  
-{info}
+*Key Notes:*
+- PARAMTER is largest block  
 
 ----
 
@@ -272,58 +223,71 @@ h2. 10. PARAMTER Deployment
 CSV → GitLab Pipeline → vec_sdsparam → Startup Cache → API
 {code}
 
-Example:
-- if0144_par296_v1.csv
-
-{info}
-CSV structure must match mapper and DB.  
-Mismatch leads to incorrect decision output.  
-{info}
+*Key Notes:*
+- CSV, DB, Mapper must match  
 
 ----
 
 h2. 11. PARAMTER Mapper Generation
 
-- CSV → Generator → Impl class
+h3. Folder Setup
 
-{expand:title=SdsParameterJsonMapperGenerator.java}
-<PASTE FULL CODE>
-{expand}
+{code}
+parameter-mapper/
+   ├── PARAMTER-UPDATED.csv
+   ├── SdsParameterJsonMapperGenerator.java
+   ├── SdsParameterJsonMapperImplGenerator.java
+{code}
 
-{expand:title=SdsParameterJsonMapperImplGenerator.java}
-<PASTE FULL CODE>
-{expand}
+h3. Step 1 – Prepare CSV
 
-{info}
-Generated files must not be edited manually.  
-Regenerate whenever CSV changes.  
-{info}
+- Ensure correct structure  
+- No missing fields  
+
+h3. Step 2 – Generate Mapper
+
+{code}
+javac SdsParameterJsonMapperGenerator.java
+java SdsParameterJsonMapperGenerator
+{code}
+
+h3. Step 3 – Generate Impl
+
+{code}
+javac SdsParameterJsonMapperImplGenerator.java
+java SdsParameterJsonMapperImplGenerator
+{code}
+
+h3. Step 4 – Move Files
+
+- Move to mapper package  
+
+h3. Step 5 – Validate
+
+- Build project  
+- Verify mappings  
+
+*Key Notes:*
+- Never edit generated files  
+- Regenerate on CSV change  
+- Alignment is critical  
 
 ----
 
 h2. 12. Exception Handling
 
 {code}
-Exception
-   ↓
-ControllerAdvice
-   ↓
-StrategicDecisionException
-   ↓
-storeErrorResponse()
-   ↓
-Return Error Response
+Exception → StrategicDecisionException → DB Store → Response
 {code}
 
-- DES001 → DB error  
-- DES002 → Task failure  
-- DES003 → PCSM failure  
-- DES004 → JSON error  
-- DES100 → Business validation  
+- DES001 → DB  
+- DES002 → Task  
+- DES003 → PCSM  
+- DES004 → JSON  
+- DES100 → Validation  
 
-{info}
-All errors are logged and stored in DB.  
-{info}
+*Key Notes:*
+- All errors stored in DB  
 
 ----
 
@@ -341,13 +305,8 @@ Reference:
 h2. 14. SMPOJO
 
 {code}
-SM JSON → Merge → GitLab Pipeline → SMPOJO → API
+SM JSON → Pipeline → SMPOJO → API
 {code}
-
-{info}
-DAJSONDocument and all block models come from SMPOJO.  
-No manual changes in API.  
-{info}
 
 Reference:  
 [SMPOJO Creation|<ADD_SMPOJO_URL>]
@@ -357,41 +316,38 @@ Reference:
 h2. 15. Adding New Block
 
 || Step || Change || Risk ||
-| 1 | SMPOJO | Model update | Block missing |
-| 2 | ApiConstants | Add constant + EXPECTED_TASK_COUNT | DES002 |
-| 3 | PcsmConfiguration | Add block | Task not created |
-| 4 | CSV | Add mapping | Wrong data |
-| 5 | Config | ConfigRecord | Initialization failure |
-| 6 | Block | Converter | Mapping failure |
-| 7 | Sequence | BodySequence | Block not executed |
-| 8 | Mapper | JsonMapper | Missing values |
-| 9 | Task | Executor | Block skipped |
+| 1 | SMPOJO | Missing model |
+| 2 | ApiConstants | DES002 |
+| 3 | PcsmConfiguration | Task missing |
+| 4 | CSV | Wrong mapping |
+| 5 | Config | Failure |
+| 6 | Block | Failure |
+| 7 | Sequence | Not executed |
+| 8 | Mapper | Missing values |
+| 9 | Task | Skipped |
 
-{info}
-EXPECTED_TASK_COUNT mismatch is the most common production failure.  
-{info}
+*Key Notes:*
+- EXPECTED_TASK_COUNT critical  
 
 ----
 
 h2. 16. Summary
 
 {code}
-shortJSON → Parallel Tasks → Cached PARAMTER → PCSM → Post-processing → Response
+shortJSON → Parallel → Cached PARAMTER → PCSM → Response
 {code}
 
-{info}
-Parallel execution and PARAMTER caching drive performance.  
-PARAMTER is the core decision driver.  
-{info}
+*Key Notes:*
+- Performance = Parallel + Cache  
 
 ----
 
 h2. 17. Important URLs
 
 || Purpose || Link ||
-| SMPOJO Creation | <ADD_SMPOJO_URL> |
-| Database Changes | <ADD_DB_URL> |
-| Extract Generation | <ADD_EXTRACT_URL> |
+| SMPOJO | <ADD_SMPOJO_URL> |
+| DB | <ADD_DB_URL> |
+| Extract | <ADD_EXTRACT_URL> |
 | GitLab | <ADD_GITLAB> |
 | Swagger | <ADD_SWAGGER> |
 | Nexus | <ADD_NEXUS> |
