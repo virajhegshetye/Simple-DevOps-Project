@@ -36,6 +36,8 @@
 
 “Once response is received, we validate business errors, generate extract, validate execution time, store response, and return final output.”
 
+“Extract is generated using ExtractService — detailed logic is documented separately.”
+
 ---
 
 # 4. Build Phase
